@@ -48,7 +48,7 @@ def get_creds():
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        model = GenerativeModel("gemini-2.5-flash") # Updated model
+        model = GenerativeModel("gemini-2.5-flash")
         
         prompt = f"""
         Act as a Strict SEO Auditor.
@@ -199,89 +199,7 @@ if st.button("Run Audit", type="primary"):
             data = scrape_seo_data(url)
             
             if "Error" in data:
-                results.append({"Page Title": display_name, "Score": 0, "Status": "ERROR", "Error": data['Error']})
+                results.append({"Page Title": display_name, "URL": url, "Score": 0, "Status": "ERROR", "Error": data['Error']})
             else:
-                # 1. Update Display Name if CSV was empty
                 if not csv_title or not csv_title.strip():
                     display_name = data['Title']
-
-                # 2. Schema Flattening
-                schema_list = []
-                for s in data['Schema Raw']:
-                    try:
-                        j = json.loads(s)
-                        if '@graph' in j:
-                            for item in j['@graph']: schema_list.append(item.get('@type', 'Unknown'))
-                        else:
-                            schema_list.append(j.get('@type', 'Unknown'))
-                    except: pass
-                
-                flat_schema = []
-                for item in schema_list:
-                    if isinstance(item, list): flat_schema.extend(item)
-                    else: flat_schema.append(item)
-                
-                # 3. AI Analysis
-                ai_feedback = {}
-                if use_ai:
-                    ai_feedback = analyze_with_gemini(
-                        data['Body Text'], 
-                        {"Title": data['Title'], "Meta Description": data['Meta Description']},
-                        flat_schema,
-                        creds
-                    )
-
-                final_score, score_log = calculate_score(data, ai_feedback)
-                google_test_url = f"https://search.google.com/test/rich-results?url={urllib.parse.quote(url)}"
-                gen_status = "🤖 Auto-Gen" if data['Echo Score'] > 85 else "✍️ Unique"
-
-                results.append({
-                    "Page Title": display_name,
-                    "Score": final_score,
-                    "Score Log": score_log,
-                    "Current Title": data['Title'],
-                    "Len (T)": len(data['Title']),
-                    "Current Desc": data['Meta Description'],
-                    "Len (D)": len(data['Meta Description']),
-                    "AI Rating": ai_feedback.get('rating', '-'),
-                    "Writing Quality": ai_feedback.get('writing_quality', '-'),
-                    "Source": gen_status,
-                    "AI Critique": ai_feedback.get('meta_critique', '-'),
-                    "Schema": ", ".join(set(flat_schema)),
-                    "Verify": google_test_url
-                })
-            
-            bar.progress((i+1)/len(rows))
-        
-        status.text("Audit Complete!")
-        results.sort(key=lambda x: x['Score'])
-        st.session_state['seo_results'] = results
-
-if st.session_state['seo_results']:
-    df = pd.DataFrame(st.session_state['seo_results'])
-    
-    def color_rows(val):
-        if val == "High": return 'color: green; font-weight: bold'
-        if val == "Low": return 'color: red; font-weight: bold'
-        if val == "Poor": return 'color: red; font-weight: bold'
-        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold'
-        return ''
-
-    def color_score(val):
-        if isinstance(val, int):
-            if val >= 90: return 'background-color: #d4edda; color: black; font-weight: bold' 
-            if val >= 70: return 'background-color: #fff3cd; color: black; font-weight: bold' 
-            return 'background-color: #f8d7da; color: black; font-weight: bold' 
-        return ''
-
-    st.dataframe(
-        df.style.applymap(color_rows).applymap(color_score, subset=['Score']), 
-        column_config={
-            "Verify": st.column_config.LinkColumn("Google Validator"),
-            "Score": st.column_config.ProgressColumn("Health Score", format="%d", min_value=0, max_value=100),
-        },
-        use_container_width=True
-    )
-    
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Report", csv, "ai_seo_audit.csv", "text/csv")
