@@ -6,6 +6,7 @@ import io
 import csv
 import glob
 import urllib.parse
+import difflib
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 import vertexai
@@ -43,16 +44,16 @@ def get_creds():
         )
     return None
 
-# --- AI ANALYSIS (HARSHER PROMPT) ---
+# --- AI ANALYSIS ---
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        model = GenerativeModel("gemini-2.5-flash")
+        model = GenerativeModel("gemini-2.5-flash") # Updated model
         
         prompt = f"""
-        Act as a Strict SEO Auditor. Do not be polite. 
+        Act as a Strict SEO Auditor.
         
-        1. PAGE CONTENT: "{content_text[:2000]}"
+        1. PAGE CONTENT: "{content_text[:2500]}"
         2. METADATA: 
            - Title: {meta_data['Title']}
            - Desc: {meta_data['Meta Description']}
@@ -60,23 +61,61 @@ def analyze_with_gemini(content_text, meta_data, schema_data, creds):
 
         TASKS:
         1. Rating: Rate Title/Content alignment (High/Medium/Low). 
-           * CRITICAL RULE: If the Title is generic (e.g. just "Home", "Services", "About Us") without keywords or branding, rate it LOW.
-        2. Schema Gap: Suggest 1 specific Schema.org type missing. (Official types only).
-        3. Critique: Write 1 sentence on how to fix the meta tags.
+           * CRITICAL: If Title is generic (e.g. "Home", "Services") rate LOW.
+        2. Writing Quality: Grade the Meta Description. (Professional/Awkward/Poor).
+        3. Schema Gap: Suggest 1 specific Schema.org type missing. (Official types only).
+        4. Critique: Write 1 sentence on how to fix the meta tags.
 
-        OUTPUT JSON ONLY: {{ "rating": "...", "schema_suggestion": "...", "meta_critique": "..." }}
+        OUTPUT JSON ONLY: {{ "rating": "...", "writing_quality": "...", "schema_suggestion": "...", "meta_critique": "..." }}
         """
         
         response = model.generate_content(prompt, generation_config=GenerationConfig(response_mime_type="application/json"))
         return json.loads(response.text)
     except Exception as e:
-        return {"rating": "Error", "schema_suggestion": str(e), "meta_critique": ""}
+        return {"rating": "Error", "writing_quality": "Error", "schema_suggestion": str(e), "meta_critique": ""}
+
+# --- SCORING ---
+def calculate_score(data, ai_result):
+    score = 100
+    reasons = []
+
+    # Technical Checks
+    if not data['JSON Valid']:
+        score -= 30
+        reasons.append("Broken Schema Syntax (-30)")
+    if data['Title'] == "MISSING":
+        score -= 20
+        reasons.append("Missing Title (-20)")
+    if data['Meta Description'] == "MISSING":
+        score -= 20
+        reasons.append("Missing Meta Desc (-20)")
+
+    # Echo/Auto-Gen Check
+    if data['Echo Score'] > 85:
+        score -= 15
+        reasons.append("⚠️ Auto-Generated Desc (-15)")
+
+    # Length Checks
+    t_len = len(data['Title'])
+    if t_len < 10 or t_len > 70:
+        score -= 5
+        reasons.append(f"Bad Title Length ({t_len}) (-5)")
+
+    # AI Quality
+    if ai_result.get('rating') == "Low":
+        score -= 20
+        reasons.append("Irrelevant Title (-20)")
+    if ai_result.get('writing_quality') == "Poor":
+        score -= 15
+        reasons.append("Poor Grammar (-15)")
+
+    return max(0, score), ", ".join(reasons)
 
 # --- SCRAPER ---
 def scrape_seo_data(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (SEO-Auditor)'}
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
@@ -101,12 +140,19 @@ def scrape_seo_data(url):
             for tag in soup(["script", "style", "nav", "footer"]): tag.decompose()
             body_text = soup.get_text(separator=' ').strip()
 
+        # Echo Check
+        echo_score = 0
+        if meta_desc != "MISSING" and body_text:
+            matcher = difflib.SequenceMatcher(None, meta_desc, body_text[:len(meta_desc) + 50])
+            echo_score = matcher.ratio() * 100
+
         return {
             "Title": title,
             "Meta Description": meta_desc,
             "Schema Raw": schemas,
             "JSON Valid": valid_json,
-            "Body Text": body_text
+            "Body Text": body_text,
+            "Echo Score": echo_score
         }
     except Exception as e:
         return {"Error": str(e)}
@@ -137,20 +183,29 @@ if st.button("Run Audit", type="primary"):
         status = st.empty()
         
         for i, row in enumerate(rows):
-            page_title = row.get('Page Title', 'Unknown')
+            csv_title = row.get('Page Title')
             url = row.get('URL', '')
             
+            # Staging Logic
             if use_staging and staging_domain:
                 from urllib.parse import urlparse
                 path = urlparse(url).path
                 url = f"https://{staging_domain}{path}"
             
-            status.text(f"Analyzing: {page_title}...")
+            # Display Name Logic
+            display_name = csv_title if csv_title and csv_title.strip() else url
+            status.text(f"Analyzing: {display_name}...")
+            
             data = scrape_seo_data(url)
             
             if "Error" in data:
-                results.append({"Page Title": page_title, "Status": "ERROR", "Error": data['Error']})
+                results.append({"Page Title": display_name, "Score": 0, "Status": "ERROR", "Error": data['Error']})
             else:
+                # 1. Update Display Name if CSV was empty
+                if not csv_title or not csv_title.strip():
+                    display_name = data['Title']
+
+                # 2. Schema Flattening
                 schema_list = []
                 for s in data['Schema Raw']:
                     try:
@@ -166,6 +221,7 @@ if st.button("Run Audit", type="primary"):
                     if isinstance(item, list): flat_schema.extend(item)
                     else: flat_schema.append(item)
                 
+                # 3. AI Analysis
                 ai_feedback = {}
                 if use_ai:
                     ai_feedback = analyze_with_gemini(
@@ -175,39 +231,55 @@ if st.button("Run Audit", type="primary"):
                         creds
                     )
 
+                final_score, score_log = calculate_score(data, ai_feedback)
                 google_test_url = f"https://search.google.com/test/rich-results?url={urllib.parse.quote(url)}"
+                gen_status = "🤖 Auto-Gen" if data['Echo Score'] > 85 else "✍️ Unique"
 
                 results.append({
-                    "Page Title": page_title,
-                    "Current Title": data['Title'], # ADDED THIS
-                    "Len (T)": len(data['Title']),  # ADDED THIS
-                    "Current Desc": data['Meta Description'], # ADDED THIS
-                    "Len (D)": len(data['Meta Description']), # ADDED THIS
+                    "Page Title": display_name,
+                    "Score": final_score,
+                    "Score Log": score_log,
+                    "Current Title": data['Title'],
+                    "Len (T)": len(data['Title']),
+                    "Current Desc": data['Meta Description'],
+                    "Len (D)": len(data['Meta Description']),
                     "AI Rating": ai_feedback.get('rating', '-'),
+                    "Writing Quality": ai_feedback.get('writing_quality', '-'),
+                    "Source": gen_status,
                     "AI Critique": ai_feedback.get('meta_critique', '-'),
-                    "Schema Syntax": "✅ Valid" if data['JSON Valid'] else "❌ Syntax Error",
-                    "Schema Types": ", ".join(set(flat_schema)),
+                    "Schema": ", ".join(set(flat_schema)),
                     "Verify": google_test_url
                 })
             
             bar.progress((i+1)/len(rows))
         
         status.text("Audit Complete!")
+        results.sort(key=lambda x: x['Score'])
         st.session_state['seo_results'] = results
 
 if st.session_state['seo_results']:
     df = pd.DataFrame(st.session_state['seo_results'])
     
-    # Conditional Formatting
     def color_rows(val):
         if val == "High": return 'color: green; font-weight: bold'
         if val == "Low": return 'color: red; font-weight: bold'
-        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold' # Length checks
+        if val == "Poor": return 'color: red; font-weight: bold'
+        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold'
+        return ''
+
+    def color_score(val):
+        if isinstance(val, int):
+            if val >= 90: return 'background-color: #d4edda; color: black; font-weight: bold' 
+            if val >= 70: return 'background-color: #fff3cd; color: black; font-weight: bold' 
+            return 'background-color: #f8d7da; color: black; font-weight: bold' 
         return ''
 
     st.dataframe(
-        df.style.applymap(color_rows, subset=['AI Rating', 'Len (T)', 'Len (D)']), 
-        column_config={"Verify": st.column_config.LinkColumn("Google Validator")},
+        df.style.applymap(color_rows).applymap(color_score, subset=['Score']), 
+        column_config={
+            "Verify": st.column_config.LinkColumn("Google Validator"),
+            "Score": st.column_config.ProgressColumn("Health Score", format="%d", min_value=0, max_value=100),
+        },
         use_container_width=True
     )
     
