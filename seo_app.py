@@ -7,7 +7,7 @@ import csv
 import glob
 import urllib.parse
 import difflib
-import time  # <--- Added for rate limiting
+import time
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 import vertexai
@@ -45,36 +45,57 @@ def get_creds():
         )
     return None
 
-# --- AI ANALYSIS ---
+# --- AI ANALYSIS (Now includes NLP Check) ---
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        # Use the 2.5-flash model you confirmed works
-        model = GenerativeModel("gemini-2.5-flash") 
+        model = GenerativeModel("gemini-2.5-flash")
         
         prompt = f"""
         Act as a Strict SEO Auditor.
         
-        1. PAGE CONTENT: "{content_text[:2500]}"
+        1. PAGE CONTENT SAMPLE: "{content_text[:2500]}"
         2. METADATA: 
            - Title: {meta_data['Title']}
            - Desc: {meta_data['Meta Description']}
-        3. SCHEMA: {schema_data}
+        3. SCHEMA FOUND: {schema_data}
 
-        TASKS:
-        1. Rating: Rate Title/Content alignment (High/Medium/Low). 
-           * CRITICAL: If Title is generic (e.g. "Home", "Services") rate LOW.
-        2. Writing Quality: Grade the Meta Description. (Professional/Awkward/Poor).
-        3. Schema Gap: Suggest 1 specific Schema.org type missing. (Official types only).
-        4. Critique: Write 1 sentence on how to fix the meta tags.
+        YOUR ANALYSIS TASKS:
+        
+        1. LOCAL SEO CHECK (Critical):
+           - Is this a location page (address/map in content)? If YES, is 'MedicalClinic'/'LocalBusiness' schema present?
+           - If Location Page AND Missing Schema -> Rate "Low".
 
-        OUTPUT JSON ONLY: {{ "rating": "...", "writing_quality": "...", "schema_suggestion": "...", "meta_critique": "..." }}
+        2. GOOGLE NLP CHECK (Snippet Retention):
+           - Does the Meta Description explicitly mention entities found in the H1/Body?
+           - If vague ("We offer services") -> Risk: "Likely Rewrite".
+           - If specific ("We offer CBT and ADHD testing") -> Risk: "Likely Keep".
+
+        3. RATING (High/Medium/Low): 
+           - Rate Title/Content alignment. Penalize generic titles.
+
+        4. WRITING QUALITY: 
+           - Grade the Meta Description (Professional/Awkward/Poor).
+
+        5. SCHEMA GAP: 
+           - Suggest 1 specific Schema.org type missing (Official types only).
+
+        6. CRITIQUE: 
+           - Write 1 sentence on how to fix the tags.
+
+        OUTPUT JSON ONLY: {{ 
+            "rating": "...", 
+            "writing_quality": "...", 
+            "google_rewrite_risk": "Likely Keep/Likely Rewrite",
+            "schema_suggestion": "...", 
+            "meta_critique": "..." 
+        }}
         """
         
         response = model.generate_content(prompt, generation_config=GenerationConfig(response_mime_type="application/json"))
         return json.loads(response.text)
     except Exception as e:
-        return {"rating": "Error", "writing_quality": "Error", "schema_suggestion": str(e), "meta_critique": ""}
+        return {"rating": "Error", "writing_quality": "Error", "google_rewrite_risk": "Error", "schema_suggestion": str(e), "meta_critique": ""}
 
 # --- SCORING ---
 def calculate_score(data, ai_result):
@@ -103,10 +124,15 @@ def calculate_score(data, ai_result):
         score -= 5
         reasons.append(f"Bad Title Length ({t_len}) (-5)")
 
-    # AI Quality
+    # AI Quality (Includes NLP & Local Checks)
     if ai_result.get('rating') == "Low":
-        score -= 20
-        reasons.append("Irrelevant Title (-20)")
+        score -= 25
+        reasons.append("Low Relevance/Missing Local Schema (-25)")
+    
+    if ai_result.get('google_rewrite_risk') == "Likely Rewrite":
+        score -= 10
+        reasons.append("Vague Desc (Google will rewrite) (-10)")
+
     if ai_result.get('writing_quality') == "Poor":
         score -= 15
         reasons.append("Poor Grammar (-15)")
@@ -121,10 +147,12 @@ def scrape_seo_data(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
+        # 1. Metadata
         title = soup.find('title').get_text().strip() if soup.find('title') else "MISSING"
         meta = soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta['content'].strip() if meta else "MISSING"
         
+        # 2. Schema
         schemas = []
         valid_json = True
         for s in soup.find_all('script', type='application/ld+json'):
@@ -135,6 +163,7 @@ def scrape_seo_data(url):
                 except json.JSONDecodeError:
                     valid_json = False
         
+        # 3. Content
         content_area = soup.find(class_="page-content-area")
         if content_area:
             body_text = content_area.get_text(separator=' ').strip()
@@ -142,7 +171,7 @@ def scrape_seo_data(url):
             for tag in soup(["script", "style", "nav", "footer"]): tag.decompose()
             body_text = soup.get_text(separator=' ').strip()
 
-        # Echo Check
+        # 4. Echo Check
         echo_score = 0
         if meta_desc != "MISSING" and body_text:
             matcher = difflib.SequenceMatcher(None, meta_desc, body_text[:len(meta_desc) + 50])
@@ -170,7 +199,7 @@ with st.sidebar:
 
 creds = get_creds()
 if not creds:
-    st.error("⚠️ Credentials missing.")
+    st.error("⚠️ Credentials missing. Please add secrets.toml or service_account.json.")
     st.stop()
 
 csv_file = st.file_uploader("Upload Sitemap CSV", type="csv")
@@ -183,39 +212,30 @@ if st.button("Run Audit", type="primary"):
         results = []
         bar = st.progress(0)
         status = st.empty()
-        
         total_rows = len(rows)
         
         for i, row in enumerate(rows):
             csv_title = row.get('Page Title')
             url = row.get('URL', '')
             
-            # 1. SKIP EMPTY ROWS
-            if not url or str(url).strip() == "":
-                continue
+            if not url or str(url).strip() == "": continue
 
-            # Staging Logic
             if use_staging and staging_domain:
                 from urllib.parse import urlparse
                 path = urlparse(url).path
                 url = f"https://{staging_domain}{path}"
             
-            # Display Name Logic
             display_name = csv_title if csv_title and csv_title.strip() else url
             status.text(f"[{i+1}/{total_rows}] 🕷️ Scraping: {display_name}...")
             
-            # 2. ADD DELAY (Prevents API Choking)
             time.sleep(0.5) 
-            
             data = scrape_seo_data(url)
             
             if "Error" in data:
                 results.append({"Page Title": display_name, "URL": url, "Score": 0, "Status": "ERROR", "Error": data['Error']})
             else:
-                if not csv_title or not csv_title.strip():
-                    display_name = data['Title']
+                if not csv_title or not csv_title.strip(): display_name = data['Title']
 
-                # Schema Flattening
                 schema_list = []
                 for s in data['Schema Raw']:
                     try:
@@ -225,13 +245,11 @@ if st.button("Run Audit", type="primary"):
                         else:
                             schema_list.append(j.get('@type', 'Unknown'))
                     except: pass
-                
                 flat_schema = []
                 for item in schema_list:
                     if isinstance(item, list): flat_schema.extend(item)
                     else: flat_schema.append(item)
                 
-                # 3. AI Analysis
                 ai_feedback = {}
                 if use_ai:
                     status.text(f"[{i+1}/{total_rows}] 🤖 Analyzing: {display_name}...")
@@ -256,6 +274,7 @@ if st.button("Run Audit", type="primary"):
                     "Current Desc": data['Meta Description'],
                     "Len (D)": len(data['Meta Description']),
                     "AI Rating": ai_feedback.get('rating', '-'),
+                    "Google NLP Risk": ai_feedback.get('google_rewrite_risk', '-'),
                     "Writing Quality": ai_feedback.get('writing_quality', '-'),
                     "Source": gen_status,
                     "AI Critique": ai_feedback.get('meta_critique', '-'),
@@ -274,9 +293,8 @@ if st.session_state['seo_results']:
     df = pd.DataFrame(st.session_state['seo_results'])
     
     def color_rows(val):
-        if val == "High": return 'color: green; font-weight: bold'
-        if val == "Low": return 'color: red; font-weight: bold'
-        if val == "Poor": return 'color: red; font-weight: bold'
+        if val == "High" or val == "Likely Keep": return 'color: green; font-weight: bold'
+        if val == "Low" or val == "Likely Rewrite": return 'color: red; font-weight: bold'
         if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold'
         return ''
 
