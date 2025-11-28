@@ -45,93 +45,87 @@ def get_creds():
         )
     return None
 
-# --- AI ANALYSIS ---
+# --- AI ANALYSIS (Now Prescribes Schema) ---
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
         model = GenerativeModel("gemini-2.5-flash")
         
         prompt = f"""
-        Act as a Strict SEO Auditor.
+        Act as a Technical SEO Expert.
         
-        1. PAGE CONTENT SAMPLE: "{content_text[:2500]}"
-        2. METADATA: 
-           - Title: {meta_data['Title']}
-           - Desc: {meta_data['Meta Description']}
-        3. SCHEMA FOUND: {schema_data}
+        1. PAGE CONTENT: "{content_text[:2500]}"
+        2. METADATA: Title: "{meta_data['Title']}"
+        3. EXISTING SCHEMA: {schema_data}
 
-        YOUR ANALYSIS TASKS:
+        TASKS:
+        1. LOCAL CHECK: If this is a physical location page, is 'MedicalClinic' present?
+        2. RATING: Rate Title/Content alignment (High/Medium/Low).
+        3. WRITING: Grade Desc quality (Professional/Awkward/Poor).
         
-        1. LOCAL SEO CHECK (Critical):
-           - Is this a location page? If YES, is 'MedicalClinic' schema present?
-           - If Location Page AND Missing Schema -> Rate "Low".
+        4. **THE FIX (Meta Desc):** 
+           If the current Desc is 'Likely Rewrite' or 'Awkward', write a BETTER one (Max 160 chars). 
+           If it's good, return "Keep Current".
 
-        2. GOOGLE NLP CHECK:
-           - Is the description specific (Likely Keep) or vague (Likely Rewrite)?
+        5. **THE PRESCRIPTION (Schema):**
+           Look at the content. What is the SINGLE best Schema.org Type for this page?
+           - If it's a Bio -> Suggest "Physician"
+           - If it's a Disease info page -> Suggest "MedicalCondition"
+           - If it's a Service page -> Suggest "MedicalProcedure" or "Service"
+           - If it's a Blog -> Suggest "BlogPosting"
+           
+           COMPARE with "Existing Schema". If the specific type is missing, recommend it.
+           If the existing schema is already perfect, return "✅ Optimal".
 
-        3. RATING: Rate Title/Content alignment (High/Medium/Low).
-
-        4. WRITING QUALITY: Grade the Meta Description (Professional/Awkward/Poor).
-
-        5. SCHEMA GAP: 
-           - Suggest 1 specific Schema.org type missing based on content. (Official types only).
-
-        6. CRITIQUE: 
-           - Write 1 sentence on how to fix the meta tags.
-
-        OUTPUT JSON ONLY: {{ 
+        OUTPUT JSON: {{ 
             "rating": "...", 
             "writing_quality": "...", 
-            "google_rewrite_risk": "Likely Keep/Likely Rewrite",
-            "schema_suggestion": "...", 
-            "meta_critique": "..." 
+            "suggested_desc": "...", 
+            "schema_prescription": "..." 
         }}
         """
         
         response = model.generate_content(prompt, generation_config=GenerationConfig(response_mime_type="application/json"))
         return json.loads(response.text)
     except Exception as e:
-        return {"rating": "Error", "writing_quality": "Error", "google_rewrite_risk": "Error", "schema_suggestion": str(e), "meta_critique": ""}
+        return {"rating": "Error", "writing_quality": "Error", "suggested_desc": "", "schema_prescription": str(e)}
 
 # --- SCORING ---
 def calculate_score(data, ai_result):
     score = 100
     reasons = []
 
-    # Technical Checks
+    # Technical
     if not data['JSON Valid']:
         score -= 30
         reasons.append("Broken Schema Syntax (-30)")
     if data['Title'] == "MISSING":
         score -= 20
         reasons.append("Missing Title (-20)")
-    if data['Meta Description'] == "MISSING":
-        score -= 20
-        reasons.append("Missing Meta Desc (-20)")
+    if data['H1'] == "MISSING":
+        score -= 10
+        reasons.append("Missing H1 (-10)")
 
-    # Echo/Auto-Gen Check
+    # Content
     if data['Echo Score'] > 85:
         score -= 15
         reasons.append("⚠️ Auto-Generated Desc (-15)")
-
-    # Length Checks
+    
     t_len = len(data['Title'])
     if t_len < 10 or t_len > 70:
         score -= 5
-        reasons.append(f"Bad Title Length ({t_len}) (-5)")
+        reasons.append(f"Bad Title Len (-5)")
 
     # AI Quality
     if ai_result.get('rating') == "Low":
-        score -= 25
-        reasons.append("Low Relevance/Missing Local Schema (-25)")
+        score -= 20
+        reasons.append("Low Content Relevance (-20)")
     
-    if ai_result.get('google_rewrite_risk') == "Likely Rewrite":
+    # If AI suggests a specific Schema change (it didn't say "Optimal")
+    prescription = ai_result.get('schema_prescription', '')
+    if prescription and "Optimal" not in prescription and "Error" not in prescription:
         score -= 10
-        reasons.append("Vague Desc (Google will rewrite) (-10)")
-
-    if ai_result.get('writing_quality') == "Poor":
-        score -= 15
-        reasons.append("Poor Grammar (-15)")
+        reasons.append("Missing Specific Schema (-10)")
 
     return max(0, score), ", ".join(reasons)
 
@@ -144,6 +138,7 @@ def scrape_seo_data(url):
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         title = soup.find('title').get_text().strip() if soup.find('title') else "MISSING"
+        h1 = soup.find('h1').get_text().strip() if soup.find('h1') else "MISSING"
         meta = soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta['content'].strip() if meta else "MISSING"
         
@@ -171,6 +166,7 @@ def scrape_seo_data(url):
 
         return {
             "Title": title,
+            "H1": h1,
             "Meta Description": meta_desc,
             "Schema Raw": schemas,
             "JSON Valid": valid_json,
@@ -254,25 +250,18 @@ if st.button("Run Audit", type="primary"):
 
                 final_score, score_log = calculate_score(data, ai_feedback)
                 google_test_url = f"https://search.google.com/test/rich-results?url={urllib.parse.quote(url)}"
-                gen_status = "🤖 Auto-Gen" if data['Echo Score'] > 85 else "✍️ Unique"
 
                 results.append({
                     "Page Title": display_name,
                     "URL": url,
                     "Score": final_score,
                     "Score Log": score_log,
-                    # CONTENT SECTION
                     "Current Title": data['Title'],
-                    "Len (T)": len(data['Title']),
+                    "H1 Tag": data['H1'],
                     "Current Desc": data['Meta Description'],
-                    "Len (D)": len(data['Meta Description']),
-                    "Writing Quality": ai_feedback.get('writing_quality', '-'),
-                    "Google NLP Risk": ai_feedback.get('google_rewrite_risk', '-'),
-                    "Content Critique": ai_feedback.get('meta_critique', '-'),
-                    # SCHEMA SECTION
+                    "✨ AI Suggested Desc": ai_feedback.get('suggested_desc', '-'),
                     "🔍 Found Schema": ", ".join(set(flat_schema)),
-                    "💡 Missing Schema": ai_feedback.get('schema_suggestion', '-'),
-                    "Schema Syntax": "✅ Valid" if data['JSON Valid'] else "❌ Syntax Error",
+                    "💊 Rx Schema": ai_feedback.get('schema_prescription', '-'),
                     "Verify": google_test_url
                 })
             
@@ -286,9 +275,8 @@ if st.session_state['seo_results']:
     df = pd.DataFrame(st.session_state['seo_results'])
     
     def color_rows(val):
-        if val == "High" or val == "Likely Keep": return 'color: green; font-weight: bold'
-        if val == "Low" or val == "Likely Rewrite": return 'color: red; font-weight: bold'
-        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold'
+        if val == "High" or val == "✅ Optimal": return 'color: green; font-weight: bold'
+        if val == "Low": return 'color: red; font-weight: bold'
         return ''
 
     def color_score(val):
@@ -298,14 +286,11 @@ if st.session_state['seo_results']:
             return 'background-color: #f8d7da; color: black; font-weight: bold' 
         return ''
 
-    # Define Column Order for Clarity
     cols = [
         "Page Title", "URL", "Score", "Score Log", 
-        "Current Title", "Len (T)", "Current Desc", "Len (D)", 
-        "Writing Quality", "Google NLP Risk", "Content Critique", 
-        "🔍 Found Schema", "💡 Missing Schema", "Schema Syntax", "Verify"
+        "Current Title", "H1 Tag", "Current Desc", "✨ AI Suggested Desc", 
+        "🔍 Found Schema", "💊 Rx Schema", "Verify"
     ]
-    # Filter keys that exist
     display_cols = [c for c in cols if c in df.columns]
     
     st.dataframe(
