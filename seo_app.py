@@ -7,6 +7,7 @@ import csv
 import glob
 import urllib.parse
 import difflib
+import time  # <--- Added for rate limiting
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 import vertexai
@@ -48,7 +49,8 @@ def get_creds():
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        model = GenerativeModel("gemini-2.5-flash")
+        # Use the 2.5-flash model you confirmed works
+        model = GenerativeModel("gemini-2.5-flash") 
         
         prompt = f"""
         Act as a Strict SEO Auditor.
@@ -182,10 +184,16 @@ if st.button("Run Audit", type="primary"):
         bar = st.progress(0)
         status = st.empty()
         
+        total_rows = len(rows)
+        
         for i, row in enumerate(rows):
             csv_title = row.get('Page Title')
             url = row.get('URL', '')
             
+            # 1. SKIP EMPTY ROWS
+            if not url or str(url).strip() == "":
+                continue
+
             # Staging Logic
             if use_staging and staging_domain:
                 from urllib.parse import urlparse
@@ -194,7 +202,10 @@ if st.button("Run Audit", type="primary"):
             
             # Display Name Logic
             display_name = csv_title if csv_title and csv_title.strip() else url
-            status.text(f"Analyzing: {display_name}...")
+            status.text(f"[{i+1}/{total_rows}] 🕷️ Scraping: {display_name}...")
+            
+            # 2. ADD DELAY (Prevents API Choking)
+            time.sleep(0.5) 
             
             data = scrape_seo_data(url)
             
@@ -203,3 +214,88 @@ if st.button("Run Audit", type="primary"):
             else:
                 if not csv_title or not csv_title.strip():
                     display_name = data['Title']
+
+                # Schema Flattening
+                schema_list = []
+                for s in data['Schema Raw']:
+                    try:
+                        j = json.loads(s)
+                        if '@graph' in j:
+                            for item in j['@graph']: schema_list.append(item.get('@type', 'Unknown'))
+                        else:
+                            schema_list.append(j.get('@type', 'Unknown'))
+                    except: pass
+                
+                flat_schema = []
+                for item in schema_list:
+                    if isinstance(item, list): flat_schema.extend(item)
+                    else: flat_schema.append(item)
+                
+                # 3. AI Analysis
+                ai_feedback = {}
+                if use_ai:
+                    status.text(f"[{i+1}/{total_rows}] 🤖 Analyzing: {display_name}...")
+                    ai_feedback = analyze_with_gemini(
+                        data['Body Text'], 
+                        {"Title": data['Title'], "Meta Description": data['Meta Description']},
+                        flat_schema,
+                        creds
+                    )
+
+                final_score, score_log = calculate_score(data, ai_feedback)
+                google_test_url = f"https://search.google.com/test/rich-results?url={urllib.parse.quote(url)}"
+                gen_status = "🤖 Auto-Gen" if data['Echo Score'] > 85 else "✍️ Unique"
+
+                results.append({
+                    "Page Title": display_name,
+                    "URL": url,
+                    "Score": final_score,
+                    "Score Log": score_log,
+                    "Current Title": data['Title'],
+                    "Len (T)": len(data['Title']),
+                    "Current Desc": data['Meta Description'],
+                    "Len (D)": len(data['Meta Description']),
+                    "AI Rating": ai_feedback.get('rating', '-'),
+                    "Writing Quality": ai_feedback.get('writing_quality', '-'),
+                    "Source": gen_status,
+                    "AI Critique": ai_feedback.get('meta_critique', '-'),
+                    "AI Suggestion": ai_feedback.get('schema_suggestion', '-'),
+                    "Schema": ", ".join(set(flat_schema)),
+                    "Verify": google_test_url
+                })
+            
+            bar.progress((i+1)/total_rows)
+        
+        status.success("Audit Complete!")
+        results.sort(key=lambda x: x['Score'])
+        st.session_state['seo_results'] = results
+
+if st.session_state['seo_results']:
+    df = pd.DataFrame(st.session_state['seo_results'])
+    
+    def color_rows(val):
+        if val == "High": return 'color: green; font-weight: bold'
+        if val == "Low": return 'color: red; font-weight: bold'
+        if val == "Poor": return 'color: red; font-weight: bold'
+        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold'
+        return ''
+
+    def color_score(val):
+        if isinstance(val, int):
+            if val >= 90: return 'background-color: #d4edda; color: black; font-weight: bold' 
+            if val >= 70: return 'background-color: #fff3cd; color: black; font-weight: bold' 
+            return 'background-color: #f8d7da; color: black; font-weight: bold' 
+        return ''
+
+    st.dataframe(
+        df.style.applymap(color_rows).applymap(color_score, subset=['Score']), 
+        column_config={
+            "Verify": st.column_config.LinkColumn("Google Validator"),
+            "URL": st.column_config.LinkColumn("Live Page"),
+            "Score": st.column_config.ProgressColumn("Health Score", format="%d", min_value=0, max_value=100),
+        },
+        use_container_width=True
+    )
+    
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download Report", csv, "ai_seo_audit.csv", "text/csv")
