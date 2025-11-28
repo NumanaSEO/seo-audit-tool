@@ -43,33 +43,26 @@ def get_creds():
         )
     return None
 
-# --- AI ANALYSIS (Anti-Hallucination Prompt) ---
+# --- AI ANALYSIS (HARSHER PROMPT) ---
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
         model = GenerativeModel("gemini-2.5-flash")
         
         prompt = f"""
-        Act as a Strict Technical SEO Validator.
+        Act as a Strict SEO Auditor. Do not be polite. 
         
-        CONTEXT:
-        We are auditing a medical website. Accuracy is critical.
-        
-        1. PAGE CONTENT (Summary): 
-        "{content_text[:2000]}"
+        1. PAGE CONTENT: "{content_text[:2000]}"
+        2. METADATA: 
+           - Title: {meta_data['Title']}
+           - Desc: {meta_data['Meta Description']}
+        3. SCHEMA: {schema_data}
 
-        2. CURRENT METADATA: 
-        Title: {meta_data['Title']}
-        Desc: {meta_data['Meta Description']}
-
-        3. CURRENT SCHEMA (@type found): 
-        {schema_data}
-
-        TASK:
-        1. Rating: Rate the Meta Title/Content alignment (High/Medium/Low).
-        2. Missing Schema: Identify 1 specific Schema.org type missing based on content. 
-           Rule: ONLY suggest official types from Schema.org (e.g. MedicalWebPage, FAQPage, Physician). Do NOT invent types.
-        3. Critique: Write 1 short sentence improving the Meta Description.
+        TASKS:
+        1. Rating: Rate Title/Content alignment (High/Medium/Low). 
+           * CRITICAL RULE: If the Title is generic (e.g. just "Home", "Services", "About Us") without keywords or branding, rate it LOW.
+        2. Schema Gap: Suggest 1 specific Schema.org type missing. (Official types only).
+        3. Critique: Write 1 sentence on how to fix the meta tags.
 
         OUTPUT JSON ONLY: {{ "rating": "...", "schema_suggestion": "...", "meta_critique": "..." }}
         """
@@ -87,24 +80,20 @@ def scrape_seo_data(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 1. Basic Meta
         title = soup.find('title').get_text().strip() if soup.find('title') else "MISSING"
         meta = soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta['content'].strip() if meta else "MISSING"
         
-        # 2. Schema Extraction & JSON Validation
         schemas = []
         valid_json = True
         for s in soup.find_all('script', type='application/ld+json'):
             if s.string:
                 try:
-                    # Verify it is actual JSON (Python is the Judge here, not AI)
-                    json.loads(s.string) 
+                    json.loads(s.string)
                     schemas.append(s.string)
                 except json.JSONDecodeError:
                     valid_json = False
         
-        # 3. Content Extraction
         content_area = soup.find(class_="page-content-area")
         if content_area:
             body_text = content_area.get_text(separator=' ').strip()
@@ -116,7 +105,7 @@ def scrape_seo_data(url):
             "Title": title,
             "Meta Description": meta_desc,
             "Schema Raw": schemas,
-            "JSON Valid": valid_json, # Python judgment
+            "JSON Valid": valid_json,
             "Body Text": body_text
         }
     except Exception as e:
@@ -124,9 +113,7 @@ def scrape_seo_data(url):
 
 # --- UI ---
 st.title("🧠 AI-Powered SEO Auditor")
-st.markdown("Combines **Python Logic** (Fact Check) with **Gemini AI** (Strategy).")
 
-# Sidebar
 with st.sidebar:
     st.header("Settings")
     use_ai = st.checkbox("Enable AI Analysis", value=True)
@@ -135,7 +122,7 @@ with st.sidebar:
 
 creds = get_creds()
 if not creds:
-    st.error("⚠️ Google Cloud Credentials not found.")
+    st.error("⚠️ Credentials missing.")
     st.stop()
 
 csv_file = st.file_uploader("Upload Sitemap CSV", type="csv")
@@ -159,14 +146,11 @@ if st.button("Run Audit", type="primary"):
                 url = f"https://{staging_domain}{path}"
             
             status.text(f"Analyzing: {page_title}...")
-            
-            # 1. Scrape
             data = scrape_seo_data(url)
             
             if "Error" in data:
                 results.append({"Page Title": page_title, "Status": "ERROR", "Error": data['Error']})
             else:
-                # 2. Flatten Schema Types
                 schema_list = []
                 for s in data['Schema Raw']:
                     try:
@@ -182,7 +166,6 @@ if st.button("Run Audit", type="primary"):
                     if isinstance(item, list): flat_schema.extend(item)
                     else: flat_schema.append(item)
                 
-                # 3. AI Analysis
                 ai_feedback = {}
                 if use_ai:
                     ai_feedback = analyze_with_gemini(
@@ -192,17 +175,19 @@ if st.button("Run Audit", type="primary"):
                         creds
                     )
 
-                # 4. Generate Google Validator Link
                 google_test_url = f"https://search.google.com/test/rich-results?url={urllib.parse.quote(url)}"
 
                 results.append({
                     "Page Title": page_title,
+                    "Current Title": data['Title'], # ADDED THIS
+                    "Len (T)": len(data['Title']),  # ADDED THIS
+                    "Current Desc": data['Meta Description'], # ADDED THIS
+                    "Len (D)": len(data['Meta Description']), # ADDED THIS
+                    "AI Rating": ai_feedback.get('rating', '-'),
+                    "AI Critique": ai_feedback.get('meta_critique', '-'),
                     "Schema Syntax": "✅ Valid" if data['JSON Valid'] else "❌ Syntax Error",
                     "Schema Types": ", ".join(set(flat_schema)),
-                    "AI Suggestion": ai_feedback.get('schema_suggestion', '-'),
-                    "AI Alignment": ai_feedback.get('rating', '-'),
-                    "AI Critique": ai_feedback.get('meta_critique', '-'),
-                    "Verify": google_test_url # Link for human verification
+                    "Verify": google_test_url
                 })
             
             bar.progress((i+1)/len(rows))
@@ -213,15 +198,15 @@ if st.button("Run Audit", type="primary"):
 if st.session_state['seo_results']:
     df = pd.DataFrame(st.session_state['seo_results'])
     
-    def color_ai(val):
+    # Conditional Formatting
+    def color_rows(val):
         if val == "High": return 'color: green; font-weight: bold'
         if val == "Low": return 'color: red; font-weight: bold'
-        if val == "❌ Syntax Error": return 'color: red; font-weight: bold'
+        if isinstance(val, int) and (val > 160 or val < 10): return 'color: orange; font-weight: bold' # Length checks
         return ''
 
-    # Make the Verify link clickable in the table
     st.dataframe(
-        df.style.applymap(color_ai, subset=['AI Alignment', 'Schema Syntax']), 
+        df.style.applymap(color_rows, subset=['AI Rating', 'Len (T)', 'Len (D)']), 
         column_config={"Verify": st.column_config.LinkColumn("Google Validator")},
         use_container_width=True
     )
