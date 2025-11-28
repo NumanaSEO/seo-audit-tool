@@ -45,7 +45,7 @@ def get_creds():
         )
     return None
 
-# --- AI ANALYSIS (Now includes NLP Check) ---
+# --- AI ANALYSIS ---
 def analyze_with_gemini(content_text, meta_data, schema_data, creds):
     try:
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
@@ -63,25 +63,21 @@ def analyze_with_gemini(content_text, meta_data, schema_data, creds):
         YOUR ANALYSIS TASKS:
         
         1. LOCAL SEO CHECK (Critical):
-           - Is this a location page (address/map in content)? If YES, is 'MedicalClinic'/'LocalBusiness' schema present?
+           - Is this a location page? If YES, is 'MedicalClinic' schema present?
            - If Location Page AND Missing Schema -> Rate "Low".
 
-        2. GOOGLE NLP CHECK (Snippet Retention):
-           - Does the Meta Description explicitly mention entities found in the H1/Body?
-           - If vague ("We offer services") -> Risk: "Likely Rewrite".
-           - If specific ("We offer CBT and ADHD testing") -> Risk: "Likely Keep".
+        2. GOOGLE NLP CHECK:
+           - Is the description specific (Likely Keep) or vague (Likely Rewrite)?
 
-        3. RATING (High/Medium/Low): 
-           - Rate Title/Content alignment. Penalize generic titles.
+        3. RATING: Rate Title/Content alignment (High/Medium/Low).
 
-        4. WRITING QUALITY: 
-           - Grade the Meta Description (Professional/Awkward/Poor).
+        4. WRITING QUALITY: Grade the Meta Description (Professional/Awkward/Poor).
 
         5. SCHEMA GAP: 
-           - Suggest 1 specific Schema.org type missing (Official types only).
+           - Suggest 1 specific Schema.org type missing based on content. (Official types only).
 
         6. CRITIQUE: 
-           - Write 1 sentence on how to fix the tags.
+           - Write 1 sentence on how to fix the meta tags.
 
         OUTPUT JSON ONLY: {{ 
             "rating": "...", 
@@ -124,7 +120,7 @@ def calculate_score(data, ai_result):
         score -= 5
         reasons.append(f"Bad Title Length ({t_len}) (-5)")
 
-    # AI Quality (Includes NLP & Local Checks)
+    # AI Quality
     if ai_result.get('rating') == "Low":
         score -= 25
         reasons.append("Low Relevance/Missing Local Schema (-25)")
@@ -147,12 +143,10 @@ def scrape_seo_data(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # 1. Metadata
         title = soup.find('title').get_text().strip() if soup.find('title') else "MISSING"
         meta = soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta['content'].strip() if meta else "MISSING"
         
-        # 2. Schema
         schemas = []
         valid_json = True
         for s in soup.find_all('script', type='application/ld+json'):
@@ -163,7 +157,6 @@ def scrape_seo_data(url):
                 except json.JSONDecodeError:
                     valid_json = False
         
-        # 3. Content
         content_area = soup.find(class_="page-content-area")
         if content_area:
             body_text = content_area.get_text(separator=' ').strip()
@@ -171,7 +164,6 @@ def scrape_seo_data(url):
             for tag in soup(["script", "style", "nav", "footer"]): tag.decompose()
             body_text = soup.get_text(separator=' ').strip()
 
-        # 4. Echo Check
         echo_score = 0
         if meta_desc != "MISSING" and body_text:
             matcher = difflib.SequenceMatcher(None, meta_desc, body_text[:len(meta_desc) + 50])
@@ -269,17 +261,18 @@ if st.button("Run Audit", type="primary"):
                     "URL": url,
                     "Score": final_score,
                     "Score Log": score_log,
+                    # CONTENT SECTION
                     "Current Title": data['Title'],
                     "Len (T)": len(data['Title']),
                     "Current Desc": data['Meta Description'],
                     "Len (D)": len(data['Meta Description']),
-                    "AI Rating": ai_feedback.get('rating', '-'),
-                    "Google NLP Risk": ai_feedback.get('google_rewrite_risk', '-'),
                     "Writing Quality": ai_feedback.get('writing_quality', '-'),
-                    "Source": gen_status,
-                    "AI Critique": ai_feedback.get('meta_critique', '-'),
-                    "AI Suggestion": ai_feedback.get('schema_suggestion', '-'),
-                    "Schema": ", ".join(set(flat_schema)),
+                    "Google NLP Risk": ai_feedback.get('google_rewrite_risk', '-'),
+                    "Content Critique": ai_feedback.get('meta_critique', '-'),
+                    # SCHEMA SECTION
+                    "🔍 Found Schema": ", ".join(set(flat_schema)),
+                    "💡 Missing Schema": ai_feedback.get('schema_suggestion', '-'),
+                    "Schema Syntax": "✅ Valid" if data['JSON Valid'] else "❌ Syntax Error",
                     "Verify": google_test_url
                 })
             
@@ -305,15 +298,25 @@ if st.session_state['seo_results']:
             return 'background-color: #f8d7da; color: black; font-weight: bold' 
         return ''
 
+    # Define Column Order for Clarity
+    cols = [
+        "Page Title", "URL", "Score", "Score Log", 
+        "Current Title", "Len (T)", "Current Desc", "Len (D)", 
+        "Writing Quality", "Google NLP Risk", "Content Critique", 
+        "🔍 Found Schema", "💡 Missing Schema", "Schema Syntax", "Verify"
+    ]
+    # Filter keys that exist
+    display_cols = [c for c in cols if c in df.columns]
+    
     st.dataframe(
-        df.style.applymap(color_rows).applymap(color_score, subset=['Score']), 
+        df[display_cols].style.applymap(color_rows).applymap(color_score, subset=['Score']), 
         column_config={
-            "Verify": st.column_config.LinkColumn("Google Validator"),
+            "Verify": st.column_config.LinkColumn("Google Tool"),
             "URL": st.column_config.LinkColumn("Live Page"),
-            "Score": st.column_config.ProgressColumn("Health Score", format="%d", min_value=0, max_value=100),
+            "Score": st.column_config.ProgressColumn("Health", format="%d", min_value=0, max_value=100),
         },
         use_container_width=True
     )
     
-    csv = df.to_csv(index=False).encode('utf-8')
+    csv = df[display_cols].to_csv(index=False).encode('utf-8')
     st.download_button("📥 Download Report", csv, "ai_seo_audit.csv", "text/csv")
