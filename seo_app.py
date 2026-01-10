@@ -289,7 +289,7 @@ if st.session_state['seo_results']:
     cols = [
         "Page Title", "URL", "Score", "Score Log", 
         "Current Title", "H1 Tag", "Current Desc", "✨ AI Suggested Desc", 
-        "🔍 Found Schema", "💊 Rx Schema", "Verify"
+        "Found Schema", "Rx Schema", "Verify"
     ]
     display_cols = [c for c in cols if c in df.columns]
     
