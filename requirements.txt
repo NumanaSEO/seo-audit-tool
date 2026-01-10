@@ -1,6 +1,6 @@
-streamlit
-pandas
-requests
-beautifulsoup4
-google-auth
-google-cloud-aiplatform
+streamlit==1.37.1
+pandas==2.2.2
+requests==2.32.3
+beautifulsoup4==4.12.3
+google-auth==2.36.0
+google-cloud-aiplatform==1.71.1
